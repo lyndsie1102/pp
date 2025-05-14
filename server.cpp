@@ -8,8 +8,11 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include "json.hpp"
+#include "json.hpp"  // Include the JSON library
+#include "tinyxml2.h"  // Include TinyXML2 for XML processing
+
 using json = nlohmann::json;
+using namespace tinyxml2;
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
@@ -72,8 +75,48 @@ std::string process_log_data(const std::string &log_data, const std::string &gro
             return "Invalid JSON format.\n";
         }
     }
-    else
-    { // txt
+    else if (format == "xml")
+    {
+        XMLDocument doc;
+        doc.Parse(log_data.c_str());
+
+        XMLElement *root = doc.FirstChildElement("logs");
+        if (root == nullptr)
+            return "Invalid XML format.\n";
+
+        for (XMLElement *log_element = root->FirstChildElement("log"); log_element != nullptr; log_element = log_element->NextSiblingElement("log"))
+        {
+            std::string timestamp = log_element->FirstChildElement("timestamp")->GetText();
+            std::string log_level = log_element->FirstChildElement("log_level")->GetText();
+            std::string user_id = log_element->FirstChildElement("user_id")->GetText();
+            std::string ip_address = log_element->FirstChildElement("ip_address")->GetText();
+
+            // Date range check
+            if (has_date_range)
+            {
+                struct tm log_tm = {};
+                if (strptime(timestamp.c_str(), "%Y-%m-%d %H:%M:%S", &log_tm) == nullptr)
+                {
+                    continue;
+                }
+                time_t log_time = mktime(&log_tm);
+                if (log_time < mktime(&start_tm) || log_time > mktime(&end_tm))
+                    continue;
+            }
+
+            std::string key;
+            if (group_by == "user")
+                key = user_id;
+            else if (group_by == "ip")
+                key = ip_address;
+            else if (group_by == "level")
+                key = log_level;
+
+            result_counts[key]++;
+        }
+    }
+    else  // txt
+    {
         std::istringstream iss(log_data);
         std::string line;
 
@@ -186,79 +229,50 @@ int main()
 
         std::cout << "Client connected.\n";
 
-        // 1. Receive format (txt/json)
-        char format_buffer[BUFFER_SIZE] = {0};
-        int bytesRead = read(new_socket, format_buffer, BUFFER_SIZE - 1);
-        if (bytesRead <= 0)
-        {
-            std::cerr << "Failed to read format\n";
-            close(new_socket);
-            continue;
-        }
-        std::string file_format(format_buffer, bytesRead);
-
-        // 2. Receive grouping criteria
-        char group_by_buffer[BUFFER_SIZE] = {0};
-        bytesRead = read(new_socket, group_by_buffer, BUFFER_SIZE - 1);
-        if (bytesRead <= 0)
-        {
-            std::cerr << "Failed to read group_by\n";
-            close(new_socket);
-            continue;
-        }
-        std::string group_by(group_by_buffer, bytesRead);
-
-        // 3. Receive optional date range decision (y/n)
-        char date_choice;
-        bytesRead = read(new_socket, &date_choice, 1);
-        if (bytesRead <= 0)
-        {
-            std::cerr << "Failed to read date range choice\n";
-            close(new_socket);
-            continue;
-        }
-
-        // 4. Receive start and end dates if applicable
-        std::string start_date = "", end_date = "";
-        if (date_choice == 'y' || date_choice == 'Y')
-        {
-            char start_date_buffer[BUFFER_SIZE] = {0};
-            bytesRead = read(new_socket, start_date_buffer, BUFFER_SIZE - 1);
-            if (bytesRead <= 0)
-            {
-                std::cerr << "Failed to read start date\n";
-                close(new_socket);
-                continue;
-            }
-            start_date = std::string(start_date_buffer, bytesRead);
-
-            char end_date_buffer[BUFFER_SIZE] = {0};
-            bytesRead = read(new_socket, end_date_buffer, BUFFER_SIZE - 1);
-            if (bytesRead <= 0)
-            {
-                std::cerr << "Failed to read end date\n";
-                close(new_socket);
-                continue;
-            }
-            end_date = std::string(end_date_buffer, bytesRead);
-        }
-
-        // 5. Read log data
-        std::ostringstream log_stream;
+        // 1. Receive the entire payload (JSON with all log files)
+        std::ostringstream payload_stream;
+        int bytesRead;
         while ((bytesRead = read(new_socket, buffer, BUFFER_SIZE)) > 0)
         {
-            log_stream.write(buffer, bytesRead);
+            payload_stream.write(buffer, bytesRead);
         }
-        std::string log_data = log_stream.str();
+        std::string payload = payload_stream.str();
 
-        // 6. Process and respond
-        std::string result = process_log_data(log_data, group_by, start_date, end_date, file_format);
-        send(new_socket, result.c_str(), result.size(), 0);
-        std::cout << "Processed data sent to client.\n";
+        // 2. Parse the received JSON
+        json envelope;
+        try
+        {
+            envelope = json::parse(payload);
+        }
+        catch (...)
+        {
+            std::cerr << "Invalid JSON received.\n";
+            continue;
+        }
 
+        // Extract metadata
+        std::string group_by = envelope["group_by"];
+        std::string start_date = envelope.value("start_date", "");
+        std::string end_date = envelope.value("end_date", "");
+
+        // Process each log file (json, txt, xml)
+        std::string json_result = process_log_data(envelope["log_json"], group_by, start_date, end_date, "json");
+        std::string txt_result = process_log_data(envelope["log_txt"], group_by, start_date, end_date, "txt");
+        std::string xml_result = process_log_data(envelope["log_xml"], group_by, start_date, end_date, "xml");
+
+        // Combine the results
+        json result_json;
+        result_json["json_result"] = json_result;
+        result_json["txt_result"] = txt_result;
+        result_json["xml_result"] = xml_result;
+
+        // Send the results back to the client
+        std::string result_payload = result_json.dump();
+        send(new_socket, result_payload.c_str(), result_payload.size(), 0);
+
+        std::cout << "Processed data sent back to client.\n";
         close(new_socket);
-        std::cout << "Client disconnected.\n";
     }
-    close(server_fd);
+
     return 0;
 }
