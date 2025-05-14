@@ -1,316 +1,264 @@
 #include <iostream>
 #include <fstream>
-#include <vector>
-#include <string>
-#include <cstring>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <map>
-#include <cstdint>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <thread>
-#include <nlohmann/json.hpp>
-#include <tinyxml2.h>
-#include <regex>
 #include <sstream>
-
-#if defined(__APPLE__) || defined(__linux__)
-static inline uint64_t htobe64(uint64_t x)
-{
-    uint32_t hi = htonl((uint32_t)(x >> 32));
-    uint32_t lo = htonl((uint32_t)(x & 0xFFFFFFFFULL));
-    return ((uint64_t)lo << 32) | hi;
-}
-#endif
-
-#define SERVER_PORT 12345
-#define BUFFER_SIZE 4096
-
+#include <string>
+#include <unordered_map>
+#include <cstring>
+#include <ctime>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include "json.hpp"
 using json = nlohmann::json;
 
-// === Helper Functions ===
+#define PORT 8080
+#define BUFFER_SIZE 1024
 
-ssize_t send_all(int sockfd, const void *buf, size_t len, int flags = 0)
+std::string process_log_data(const std::string &log_data, const std::string &group_by,
+                             const std::string &start_date = "", const std::string &end_date = "",
+                             const std::string &format = "txt")
 {
-    size_t total_sent = 0;
-    while (total_sent < len)
+    std::unordered_map<std::string, int> result_counts;
+
+    // Parse date range
+    struct tm start_tm = {}, end_tm = {};
+    bool has_date_range = false;
+    if (!start_date.empty() && !end_date.empty())
     {
-        ssize_t sent = send(sockfd, (const char *)buf + total_sent, len - total_sent, flags | MSG_NOSIGNAL);
-        if (sent == -1)
+        strptime(start_date.c_str(), "%Y-%m-%d %H:%M:%S", &start_tm);
+        strptime(end_date.c_str(), "%Y-%m-%d %H:%M:%S", &end_tm);
+        has_date_range = true;
+    }
+
+    if (format == "json")
+    {
+        try
         {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (sent == 0)
-            return 0;
-        total_sent += sent;
-    }
-    return total_sent;
-}
+            auto logs = json::parse(log_data);
 
-ssize_t recv_all(int sockfd, void *buf, size_t len, int flags = 0)
-{
-    size_t total_received = 0;
-    while (total_received < len)
-    {
-        ssize_t received = recv(sockfd, (char *)buf + total_received, len - total_received, flags);
-        if (received == -1)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (received == 0)
-            return 0;
-        total_received += received;
-    }
-    return total_received;
-}
-
-uint64_t be64toh(uint64_t x)
-{
-    uint32_t hi = ntohl((uint32_t)(x >> 32));
-    uint32_t lo = ntohl((uint32_t)(x & 0xFFFFFFFFULL));
-    return ((uint64_t)lo << 32) | hi;
-}
-
-void create_directory_if_not_exists(const std::string &dir)
-{
-    struct stat info;
-    if (stat(dir.c_str(), &info) != 0 || !(info.st_mode & S_IFDIR))
-    {
-        if (mkdir(dir.c_str(), 0777) != 0)
-            std::cerr << "❌ Failed to create directory: " << dir << std::endl;
-        else
-            std::cout << "📂 Directory created: " << dir << std::endl;
-    }
-}
-
-std::string get_basename(const std::string &filepath)
-{
-    size_t pos = filepath.find_last_of("/\\");
-    return (pos == std::string::npos) ? filepath : filepath.substr(pos + 1);
-}
-
-// === Core File Processing Logic ===
-
-bool ends_with(const std::string &str, const std::string &suffix) {
-    return str.size() >= suffix.size() &&
-           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-
-void process_json_file(const std::string &file_content, const std::string &count_type, const std::string &output_filename)
-{
-    json j = json::parse(file_content);
-    std::map<std::string, int> counter;
-
-    for (const auto &entry : j)
-    {
-        std::string key = (count_type == "user") ? std::to_string(entry["user_id"].get<int>()) : entry["ip_address"].get<std::string>();
-        counter[key]++;
-    }
-
-    json result;
-    result["type"] = count_type;
-    result[(count_type == "user") ? "users" : "ips"] = counter;
-
-    std::ofstream out(output_filename);
-    out << result.dump(4);
-}
-
-void process_xml_file(const std::string &file_content, const std::string &count_type, const std::string &output_filename)
-{
-    tinyxml2::XMLDocument doc;
-    doc.Parse(file_content.c_str());
-
-    std::map<std::string, int> counter;
-    tinyxml2::XMLElement *root = doc.RootElement();
-    for (tinyxml2::XMLElement *log = root->FirstChildElement("log"); log; log = log->NextSiblingElement("log"))
-    {
-        const char *key = nullptr;
-        if (count_type == "user")
-            key = log->FirstChildElement("user_id") ? log->FirstChildElement("user_id")->GetText() : nullptr;
-        else
-            key = log->FirstChildElement("ip_address") ? log->FirstChildElement("ip_address")->GetText() : nullptr;
-
-        if (key)
-            counter[key]++;
-    }
-
-    std::ofstream out(output_filename);
-    out << "<result>\n  <type>" << count_type << "</type>\n";
-    for (const auto &[key, value] : counter)
-        out << "  <entry><id>" << key << "</id><count>" << value << "</count></entry>\n";
-    out << "</result>";
-}
-
-void process_txt_file(const std::string &file_content, const std::string &count_type, const std::string &output_filename)
-{
-    std::map<std::string, int> counter;
-    std::istringstream iss(file_content);
-    std::string line;
-    std::regex user_id_regex(R"(UserID:\s*(\d+))");
-    std::regex ip_regex(R"(IP:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+))");
-
-    while (std::getline(iss, line))
-    {
-        std::smatch match;
-        if (count_type == "user" && std::regex_search(line, match, user_id_regex))
-            counter[match[1].str()]++;
-        else if (count_type == "ip" && std::regex_search(line, match, ip_regex))
-            counter[match[1].str()]++;
-    }
-
-    std::ofstream out(output_filename);
-    out << "Result (type: " << count_type << "):\n";
-    for (const auto &[key, value] : counter)
-        out << key << ": " << value << "\n";
-}
-
-// === Client Handler ===
-
-void handle_client(int client_socket)
-{
-    try
-    {
-        while (true)
-        {
-            uint32_t count_type_len_net;
-            if (recv_all(client_socket, &count_type_len_net, sizeof(count_type_len_net)) <= 0) break;
-            uint32_t count_type_len = ntohl(count_type_len_net);
-
-            std::vector<char> type_buf(count_type_len + 1);
-            if (recv_all(client_socket, type_buf.data(), count_type_len) <= 0) break;
-            type_buf[count_type_len] = '\0';
-            std::string count_type(type_buf.data());
-
-            uint32_t file_count_net;
-            if (recv(client_socket, &file_count_net, sizeof(file_count_net), 0) <= 0) break;
-            uint32_t file_count = ntohl(file_count_net);
-
-            std::vector<std::string> result_files;
-            create_directory_if_not_exists("result_test_clients");
-
-            for (uint32_t i = 0; i < file_count; ++i)
+            for (const auto &entry : logs)
             {
-                uint32_t name_size_net;
-                if (recv(client_socket, &name_size_net, sizeof(name_size_net), 0) <= 0) break;
-                uint32_t name_size = ntohl(name_size_net);
+                std::string timestamp = entry["timestamp"];
+                std::string log_level = entry["log_level"];
+                std::string user_id = std::to_string(entry["user_id"].get<int>());
+                std::string ip_address = entry["ip_address"];
 
-                std::vector<char> name_buf(name_size + 1);
-                if (recv(client_socket, name_buf.data(), name_size, 0) <= 0) break;
-                name_buf[name_size] = '\0';
-                std::string clean_name = get_basename(std::string(name_buf.data()));
+                // Date range check
+                if (has_date_range)
+                {
+                    struct tm log_tm = {};
+                    if (strptime(timestamp.c_str(), "%Y-%m-%d %H:%M:%S", &log_tm) == nullptr)
+                    {
+                        continue;
+                    }
+                    time_t log_time = mktime(&log_tm);
+                    if (log_time < mktime(&start_tm) || log_time > mktime(&end_tm))
+                        continue;
+                }
 
-                uint64_t size_net;
-                if (recv(client_socket, &size_net, sizeof(size_net), 0) <= 0) break;
-                uint64_t file_size = be64toh(size_net);
+                std::string key;
+                if (group_by == "user")
+                    key = user_id;
+                else if (group_by == "ip")
+                    key = ip_address;
+                else if (group_by == "level")
+                    key = log_level;
 
-                std::vector<char> data(file_size);
-                if (recv_all(client_socket, data.data(), file_size) <= 0) break;
-
-                std::string content(data.begin(), data.end());
-                std::string result_file = "result_test_clients/" + clean_name;
-
-                if (ends_with(clean_name, ".json"))
-                    process_json_file(content, count_type, result_file);
-                else if (ends_with(clean_name, ".xml"))
-                    process_xml_file(content, count_type, result_file);
-                else if (ends_with(clean_name, ".txt"))
-                    process_txt_file(content, count_type, result_file);
-
-                result_files.push_back(result_file);
-                std::cout << "✅ Processed file: " << clean_name << std::endl;
-            }
-
-            // Send results
-            uint32_t result_count_net = htonl(result_files.size());
-            send(client_socket, &result_count_net, sizeof(result_count_net), 0);
-
-            for (const auto &path : result_files)
-            {
-                uint32_t fname_len = path.length();
-                uint32_t fname_len_net = htonl(fname_len);
-                send(client_socket, &fname_len_net, sizeof(fname_len_net), 0);
-                send_all(client_socket, path.c_str(), fname_len);
-
-                std::ifstream infile(path, std::ios::binary);
-                infile.seekg(0, std::ios::end);
-                uint64_t fsize = infile.tellg();
-                infile.seekg(0);
-                uint64_t fsize_net = htobe64(fsize);
-                send(client_socket, &fsize_net, sizeof(fsize_net), 0);
-
-                char buffer[BUFFER_SIZE];
-                while (infile.read(buffer, sizeof(buffer)))
-                    send_all(client_socket, buffer, infile.gcount());
-                if (infile.gcount() > 0)
-                    send_all(client_socket, buffer, infile.gcount());
-                infile.close();
+                result_counts[key]++;
             }
         }
+        catch (...)
+        {
+            return "Invalid JSON format.\n";
+        }
     }
-    catch (...)
+    else
+    { // txt
+        std::istringstream iss(log_data);
+        std::string line;
+
+        while (std::getline(iss, line))
+        {
+            std::string date = line.substr(0, 19);
+            std::string level, userid, ip;
+
+            if (line.find("INFO") != std::string::npos)
+                level = "INFO";
+            else if (line.find("WARN") != std::string::npos)
+                level = "WARN";
+            else if (line.find("ERROR") != std::string::npos)
+                level = "ERROR";
+            else if (line.find("CRITICAL") != std::string::npos)
+                level = "CRITICAL";
+
+            std::size_t user_pos = line.find("UserID:");
+            if (user_pos != std::string::npos)
+            {
+                std::istringstream user_stream(line.substr(user_pos));
+                std::string label;
+                user_stream >> label >> userid;
+            }
+
+            std::size_t ip_pos = line.find("IP:");
+            if (ip_pos != std::string::npos)
+            {
+                std::istringstream ip_stream(line.substr(ip_pos));
+                std::string label;
+                ip_stream >> label >> ip;
+            }
+
+            if ((group_by == "user" && userid.empty()) ||
+                (group_by == "ip" && ip.empty()) ||
+                (group_by == "level" && level.empty()))
+                continue;
+
+            if (has_date_range)
+            {
+                struct tm log_tm = {};
+                strptime(date.c_str(), "%Y-%m-%d %H:%M:%S", &log_tm);
+                time_t log_time = mktime(&log_tm);
+                if (log_time < mktime(&start_tm) || log_time > mktime(&end_tm))
+                    continue;
+            }
+
+            std::string key;
+            if (group_by == "user")
+                key = userid;
+            else if (group_by == "ip")
+                key = ip;
+            else if (group_by == "level")
+                key = level;
+
+            result_counts[key]++;
+        }
+    }
+
+    // Format output
+    std::ostringstream result;
+    for (const auto &pair : result_counts)
     {
-        std::cerr << "❌ Error in client thread\n";
+        result << group_by << " " << pair.first << ": " << pair.second << " entries\n";
     }
 
-    close(client_socket);
-    std::cout << "🔌 Client disconnected.\n";
+    return result.str();
 }
-
-// === Main Server Loop ===
 
 int main()
 {
-    int server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket == -1)
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    char buffer[BUFFER_SIZE];
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == 0)
     {
-        std::cerr << "❌ Socket creation failed\n";
+        perror("Socket failed");
         return 1;
     }
 
-    int optval = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-#ifdef SO_NOSIGPIPE
-    setsockopt(server_socket, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
-#endif
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
 
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0)
     {
-        std::cerr << "❌ Bind failed\n";
+        perror("Bind failed");
         return 1;
     }
 
-    if (listen(server_socket, 10) < 0)
+    if (listen(server_fd, 3) < 0)
     {
-        std::cerr << "❌ Listen failed\n";
+        perror("Listen failed");
         return 1;
     }
 
-    std::cout << "🚀 Server is listening on port " << SERVER_PORT << "\n";
+    std::cout << "Server listening on port " << PORT << "...\n";
 
     while (true)
     {
-        int client_socket = accept(server_socket, nullptr, nullptr);
-        if (client_socket == -1)
+        new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen);
+        if (new_socket < 0)
         {
-            std::cerr << "❌ Accept failed\n";
+            perror("Accept failed");
             continue;
         }
-        std::cout << "✔️ Client connected!\n";
-        std::thread(handle_client, client_socket).detach();
-    }
 
-    close(server_socket);
+        std::cout << "Client connected.\n";
+
+        // 1. Receive format (txt/json)
+        char format_buffer[BUFFER_SIZE] = {0};
+        int bytesRead = read(new_socket, format_buffer, BUFFER_SIZE - 1);
+        if (bytesRead <= 0)
+        {
+            std::cerr << "Failed to read format\n";
+            close(new_socket);
+            continue;
+        }
+        std::string file_format(format_buffer, bytesRead);
+
+        // 2. Receive grouping criteria
+        char group_by_buffer[BUFFER_SIZE] = {0};
+        bytesRead = read(new_socket, group_by_buffer, BUFFER_SIZE - 1);
+        if (bytesRead <= 0)
+        {
+            std::cerr << "Failed to read group_by\n";
+            close(new_socket);
+            continue;
+        }
+        std::string group_by(group_by_buffer, bytesRead);
+
+        // 3. Receive optional date range decision (y/n)
+        char date_choice;
+        bytesRead = read(new_socket, &date_choice, 1);
+        if (bytesRead <= 0)
+        {
+            std::cerr << "Failed to read date range choice\n";
+            close(new_socket);
+            continue;
+        }
+
+        // 4. Receive start and end dates if applicable
+        std::string start_date = "", end_date = "";
+        if (date_choice == 'y' || date_choice == 'Y')
+        {
+            char start_date_buffer[BUFFER_SIZE] = {0};
+            bytesRead = read(new_socket, start_date_buffer, BUFFER_SIZE - 1);
+            if (bytesRead <= 0)
+            {
+                std::cerr << "Failed to read start date\n";
+                close(new_socket);
+                continue;
+            }
+            start_date = std::string(start_date_buffer, bytesRead);
+
+            char end_date_buffer[BUFFER_SIZE] = {0};
+            bytesRead = read(new_socket, end_date_buffer, BUFFER_SIZE - 1);
+            if (bytesRead <= 0)
+            {
+                std::cerr << "Failed to read end date\n";
+                close(new_socket);
+                continue;
+            }
+            end_date = std::string(end_date_buffer, bytesRead);
+        }
+
+        // 5. Read log data
+        std::ostringstream log_stream;
+        while ((bytesRead = read(new_socket, buffer, BUFFER_SIZE)) > 0)
+        {
+            log_stream.write(buffer, bytesRead);
+        }
+        std::string log_data = log_stream.str();
+
+        // 6. Process and respond
+        std::string result = process_log_data(log_data, group_by, start_date, end_date, file_format);
+        send(new_socket, result.c_str(), result.size(), 0);
+        std::cout << "Processed data sent to client.\n";
+
+        close(new_socket);
+        std::cout << "Client disconnected.\n";
+    }
+    close(server_fd);
     return 0;
 }
