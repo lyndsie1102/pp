@@ -1,212 +1,211 @@
 #include <iostream>
 #include <fstream>
-#include <thread>
 #include <vector>
-#include <set>
-#include <map>
-#include <netinet/in.h>
-#include <unistd.h>
+#include <string>
 #include <cstring>
-#include <tinyxml2.h>
-
-#ifdef __linux__
-#include <endian.h>
-#elif defined(__APPLE__)
-#include <libkern/OSByteOrder.h>
-#define be64toh(x) OSSwapBigToHostInt64(x)
-#endif
-
-#include <nlohmann/json.hpp>
-using json = nlohmann::json;
-using namespace tinyxml2;
-
-#define PORT 12345
-#define BUFFER_SIZE 4096
-#if defined(__APPLE__)
-#include <libkern/OSByteOrder.h>
-#define be64toh(x) OSSwapBigToHostInt64(x)
-#define htobe64(x) OSSwapHostToBigInt64(x)
-#elif defined(__linux__)
-#include <endian.h>
-#else
-// Fallback if not defined
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <map>
 #include <cstdint>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <thread>
+#include <nlohmann/json.hpp>
+#include <tinyxml2.h>
+#include <regex>
+
+#if defined(__APPLE__) || defined(__linux__)
 static inline uint64_t htobe64(uint64_t x)
 {
     uint32_t hi = htonl((uint32_t)(x >> 32));
     uint32_t lo = htonl((uint32_t)(x & 0xFFFFFFFFULL));
-    return ((uint64_t)hi << 32) | lo;
+    return ((uint64_t)lo << 32) | hi;
 }
 #endif
 
-// --- Function Declarations ---
-void count_unique_users_json(const std::string &filename);
-void count_unique_users_txt(const std::string &filename);
-void count_unique_users_xml(const std::string &filename);
+#define SERVER_PORT 12345
+#define BUFFER_SIZE 4096
 
-// --- Function Definitions ---
-void count_unique_users_json(const std::string &filename)
+using json = nlohmann::json;
+
+// Function to convert bytes from network byte order to host byte order (Big Endian to Host Endian)
+uint64_t be64toh(uint64_t x)
 {
-    std::ifstream infile(filename);
-    if (!infile.is_open())
-    {
-        std::cerr << "❌ Failed to open JSON file: " << filename << "\n";
-        return;
-    }
+    uint32_t hi = ntohl((uint32_t)(x >> 32));
+    uint32_t lo = ntohl((uint32_t)(x & 0xFFFFFFFFULL));
+    return ((uint64_t)lo << 32) | hi;
+}
 
-    try
-    {
-        json logs;
-        infile >> logs;
-        std::map<std::string, std::set<int>> ip_to_users;
-
-        for (const auto &entry : logs)
-        {
-            if (entry.contains("ip_address") && entry.contains("user_id") &&
-                entry["ip_address"].is_string() && entry["user_id"].is_number_integer())
-            {
-                ip_to_users[entry["ip_address"]].insert(entry["user_id"].get<int>());
-            }
+// Function to create directory if it does not exist
+void create_directory_if_not_exists(const std::string &dir) {
+    struct stat info;
+    if (stat(dir.c_str(), &info) != 0 || !(info.st_mode & S_IFDIR)) {
+        if (mkdir(dir.c_str(), 0777) != 0) {
+            std::cerr << "❌ Failed to create directory: " << dir << std::endl;
+        } else {
+            std::cout << "📂 Directory created: " << dir << std::endl;
         }
-
-        std::string base_filename = filename.substr(filename.find_last_of("/\\") + 1);
-        std::string result_filename = "result_" + base_filename + ".json";
-        std::ofstream result_out(result_filename);
-        if (result_out.is_open())
-        {
-            json result;
-            for (const auto &[ip, users] : ip_to_users)
-            {
-                result[ip] = users.size();
-            }
-            result_out << result.dump(4);
-            result_out.close();
-            std::cout << "📝 JSON result written to " << result_filename << "\n";
-        }
-        else
-        {
-            std::cerr << "❌ Failed to write result file for: " << filename << "\n";
-        }
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "❌ JSON parse error: " << e.what() << "\n";
     }
 }
 
-void count_unique_users_txt(const std::string &filename)
-{
-    std::ifstream infile(filename);
-    if (!infile.is_open())
-    {
-        std::cerr << "❌ Failed to open TXT file: " << filename << "\n";
+// Helper function to create full directory structure
+void create_directory_structure(const std::string &filepath) {
+    size_t pos = 0;
+    std::string dir;
+    while ((pos = filepath.find('/', pos + 1)) != std::string::npos) {
+        dir = filepath.substr(0, pos);
+        create_directory_if_not_exists(dir);
+    }
+}
+
+// Function to count unique users in a JSON file
+void count_unique_users_json(const std::string &filename, const std::string &count_type) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "❌ Failed to open JSON file: " << filename << std::endl;
         return;
     }
 
-    std::map<std::string, std::set<int>> ip_to_users;
+    json j;
+    file >> j;
+
+    std::map<std::string, int> counter;
+    for (const auto& entry : j) {
+        if (count_type == "user") {
+            std::string user_id = std::to_string(entry["user_id"].get<int>());
+            counter[user_id]++;
+        } else if (count_type == "ip") {
+            std::string ip = entry["ip_address"].get<std::string>();
+            counter[ip]++;
+        }
+    }
+
+    std::string result_filename = "result_test_clients/" + filename;
+    create_directory_structure(result_filename);
+
+    json result;
+    result["type"] = count_type;
+    result[count_type == "user" ? "users" : "ips"] = counter;
+
+    std::ofstream result_file(result_filename);
+    if (!result_file.is_open()) {
+        std::cerr << "❌ Failed to open result file: " << result_filename << std::endl;
+        return;
+    }
+
+    result_file << result.dump(4);
+    result_file.close();
+    std::cout << "✅ Result saved to " << result_filename << std::endl;
+}
+
+// Function to count unique users in an XML file
+void count_unique_users_xml(const std::string &filename, const std::string &count_type) {
+    tinyxml2::XMLDocument doc;
+    if (doc.LoadFile(filename.c_str()) != tinyxml2::XML_SUCCESS) {
+        std::cerr << "❌ Failed to open XML file: " << filename << std::endl;
+        return;
+    }
+
+    tinyxml2::XMLElement* root = doc.RootElement();
+    std::map<std::string, int> counter;
+
+    for (tinyxml2::XMLElement* logElement = root->FirstChildElement("log"); logElement != nullptr; logElement = logElement->NextSiblingElement("log")) {
+        if (count_type == "user") {
+            auto* userElement = logElement->FirstChildElement("user_id");
+            if (userElement && userElement->GetText()) {
+                std::string user_id = userElement->GetText();
+                counter[user_id]++;
+            }
+        } else if (count_type == "ip") {
+            auto* ipElement = logElement->FirstChildElement("ip_address");
+            if (ipElement && ipElement->GetText()) {
+                std::string ip = ipElement->GetText();
+                counter[ip]++;
+            }
+        }
+    }
+
+    std::string result_filename = "result_test_clients/" + filename;
+    create_directory_structure(result_filename);
+
+    std::ofstream result_file(result_filename);
+    if (!result_file.is_open()) {
+        std::cerr << "❌ Failed to open result file: " << result_filename << std::endl;
+        return;
+    }
+
+    result_file << "<result>\n  <type>" << count_type << "</type>\n";
+    for (const auto& [key, value] : counter) {
+        result_file << "  <entry><id>" << key << "</id><count>" << value << "</count></entry>\n";
+    }
+    result_file << "</result>";
+
+    result_file.close();
+    std::cout << "✅ Result saved to " << result_filename << std::endl;
+}
+
+
+// Function to count unique users in a TXT file
+void count_unique_users_txt(const std::string &filename, const std::string &count_type) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "❌ Failed to open TXT file: " << filename << std::endl;
+        return;
+    }
+
+    std::map<std::string, int> counter;
     std::string line;
+    std::regex user_id_regex(R"(UserID:\s*(\d+))");
+    std::regex ip_regex(R"(IP:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+))");
 
-    while (std::getline(infile, line))
-    {
-        size_t user_pos = line.find("UserID:");
-        size_t ip_pos = line.find("IP:");
-        if (user_pos != std::string::npos && ip_pos != std::string::npos)
-        {
-            try
-            {
-                int user_id = std::stoi(line.substr(user_pos + 7, ip_pos - user_pos - 7));
-                std::string ip = line.substr(ip_pos + 3);
-                ip.erase(0, ip.find_first_not_of(" \r\n"));
-                ip.erase(ip.find_last_not_of(" \r\n") + 1);
-                ip_to_users[ip].insert(user_id);
-            }
-            catch (const std::exception &e)
-            {
-                std::cerr << "❌ Parse error: " << e.what() << "\n";
-            }
+    while (std::getline(file, line)) {
+        std::smatch match;
+        if (count_type == "user" && std::regex_search(line, match, user_id_regex)) {
+            counter[match[1].str()]++;
+        } else if (count_type == "ip" && std::regex_search(line, match, ip_regex)) {
+            counter[match[1].str()]++;
         }
     }
 
-    std::string base_filename = filename.substr(filename.find_last_of("/\\") + 1);
-    std::string result_filename = "result_" + base_filename + ".json";
-    std::ofstream out(result_filename);
-    if (out.is_open())
-    {
-        json result;
-        for (const auto &[ip, users] : ip_to_users)
-        {
-            result[ip] = users.size();
-        }
-        out << result.dump(4);
-        out.close();
-        std::cout << "📝 TXT result written to " << result_filename << "\n";
-    }
-    else
-    {
-        std::cerr << "❌ Failed to write result file for: " << filename << "\n";
-    }
-}
+    std::string result_filename = "result_test_clients/" + filename;
+    create_directory_structure(result_filename);
 
-void count_unique_users_xml(const std::string &filename)
-{
-    XMLDocument doc;
-    if (doc.LoadFile(filename.c_str()) != XML_SUCCESS)
-    {
-        std::cerr << "❌ Failed to open XML file: " << filename << "\n";
+    std::ofstream result_file(result_filename);
+    if (!result_file.is_open()) {
+        std::cerr << "❌ Failed to open result file: " << result_filename << std::endl;
         return;
     }
 
-    std::map<std::string, std::set<int>> ip_to_users;
-    XMLElement *root = doc.RootElement();
-    if (!root)
-    {
-        std::cerr << "❌ Invalid XML: Missing <logs> root\n";
-        return;
+    result_file << "Result (type: " << count_type << "):\n";
+    for (const auto& [key, value] : counter) {
+        result_file << key << ": " << value << "\n";
     }
 
-    for (XMLElement *log = root->FirstChildElement("log"); log; log = log->NextSiblingElement("log"))
-    {
-        const char *ip = log->FirstChildElement("ip_address") ? log->FirstChildElement("ip_address")->GetText() : nullptr;
-        const char *uid = log->FirstChildElement("user_id") ? log->FirstChildElement("user_id")->GetText() : nullptr;
-        if (ip && uid)
-        {
-            try
-            {
-                ip_to_users[ip].insert(std::stoi(uid));
-            }
-            catch (const std::exception &e)
-            {
-                std::cerr << "❌ Invalid user_id: " << e.what() << "\n";
-            }
-        }
-    }
-
-    std::string base_filename = filename.substr(filename.find_last_of("/\\") + 1);
-    std::string result_filename = "result_" + base_filename + ".json";
-    std::ofstream out(result_filename);
-    if (out.is_open())
-    {
-        json result;
-        for (const auto &[ip, users] : ip_to_users)
-        {
-            result[ip] = users.size();
-        }
-        out << result.dump(4);
-        out.close();
-        std::cout << "📝 XML result written to " << result_filename << "\n";
-    }
-    else
-    {
-        std::cerr << "❌ Failed to write result file for: " << filename << "\n";
-    }
+    result_file.close();
+    std::cout << "✅ Result saved to " << result_filename << std::endl;
 }
 
-// --- Client Handler ---
+
+
+// Function to handle each client connection
 void handle_client(int client_socket)
 {
     char buffer[BUFFER_SIZE];
 
-    // Step 1: Receive number of files
+    // Step 1: Receive the count type ("user" or "ip")
+    uint32_t count_type_len_net;
+    recv(client_socket, &count_type_len_net, sizeof(count_type_len_net), 0);
+    uint32_t count_type_len = ntohl(count_type_len_net);
+
+    std::vector<char> count_type_buf(count_type_len + 1);
+    recv(client_socket, count_type_buf.data(), count_type_len, 0);
+    count_type_buf[count_type_len] = '\0';
+    std::string count_type(count_type_buf.data());
+
+    std::cout << "Client selected count type: " << count_type << std::endl;
+
+    // Step 2: Receive the number of files
     uint32_t file_count_net;
     if (recv(client_socket, &file_count_net, sizeof(file_count_net), 0) != sizeof(file_count_net))
     {
@@ -217,191 +216,185 @@ void handle_client(int client_socket)
 
     uint32_t file_count = ntohl(file_count_net);
     std::cout << "📥 Receiving " << file_count << " files...\n";
+
     std::vector<std::string> result_files;
 
-    std::string overall_response;
+    // Create base result directory if it doesn't exist
+    create_directory_if_not_exists("result_test_clients");
 
     for (uint32_t i = 0; i < file_count; ++i)
     {
-        // Step 2: Receive filename
+        // Receive filename size
         uint32_t filename_size_net;
         recv(client_socket, &filename_size_net, sizeof(filename_size_net), 0);
         uint32_t filename_size = ntohl(filename_size_net);
 
-        std::vector<char> filename(filename_size + 1);
-        recv(client_socket, filename.data(), filename_size, 0);
-        filename[filename_size] = '\0';
+        // Receive filename
+        std::vector<char> filename_buf(filename_size + 1);
+        recv(client_socket, filename_buf.data(), filename_size, 0);
+        filename_buf[filename_size] = '\0';
+        std::string filename(filename_buf.data());
 
-        // Step 3: Receive file size and contents
+        // Create directory structure for the original file
+        create_directory_structure(filename);
+
+        // Receive file size
         uint64_t file_size_net;
         recv(client_socket, &file_size_net, sizeof(file_size_net), 0);
         uint64_t file_size = be64toh(file_size_net);
 
+        std::cout << "Receiving file: " << filename << " with size: " << file_size << " bytes\n";
+
+        // Receive file content
         std::vector<char> file_data(file_size);
-        uint64_t received = 0;
+        size_t received = 0;
         while (received < file_size)
         {
-            ssize_t bytes = recv(client_socket, buffer, BUFFER_SIZE, 0);
+            ssize_t bytes = recv(client_socket, file_data.data() + received, file_size - received, 0);
             if (bytes <= 0)
+            {
+                std::cerr << "❌ Failed to receive file data, received: " << received << " out of " << file_size << " bytes\n";
                 break;
-            memcpy(file_data.data() + received, buffer, bytes); // Don't use std::memcpy
+            }
             received += bytes;
         }
 
-        std::string file_str(filename.data());
-
-        // Step 4: Save file
-        std::ofstream file_out(file_str, std::ios::binary);
-        if (!file_out.is_open())
+        // Write received data to disk
+        std::ofstream out(filename, std::ios::binary);
+        if (out.is_open())
         {
-            overall_response += "❌ Failed to save: " + file_str + "\n";
-            continue;
-        }
-        file_out.write(file_data.data(), file_data.size());
-        file_out.close();
-        std::cout << "📦 Received file: " << file_str << "\n";
-
-        // Step 5: Process based on file extension
-        std::string ext = file_str.substr(file_str.find_last_of('.') + 1);
-        if (ext == "json")
-        {
-            try
-            {
-                count_unique_users_json(file_str);
-                std::string base_filename = file_str.substr(file_str.find_last_of("/\\") + 1);
-                result_files.push_back("result_" + base_filename + ".json");
-                overall_response += "✅ Processed JSON: " + file_str + "\n";
-            }
-            catch (...)
-            {
-                overall_response += "❌ Failed to process JSON: " + file_str + "\n";
-            }
-        }
-        else if (ext == "xml")
-        {
-            try
-            {
-                count_unique_users_xml(file_str);
-                std::string base_filename = file_str.substr(file_str.find_last_of("/\\") + 1);
-                result_files.push_back("result_" + base_filename + ".json");
-                overall_response += "✅ Processed XML: " + file_str + "\n";
-            }
-            catch (...)
-            {
-                overall_response += "❌ Failed to process XML: " + file_str + "\n";
-            }
-        }
-        else if (ext == "txt")
-        {
-            try
-            {
-                count_unique_users_txt(file_str);
-                std::string base_filename = file_str.substr(file_str.find_last_of("/\\") + 1);
-                result_files.push_back("result_" + base_filename + ".json");
-                overall_response += "✅ Processed TXT: " + file_str + "\n";
-            }
-            catch (...)
-            {
-                overall_response += "❌ Failed to process TXT: " + file_str + "\n";
-            }
+            out.write(file_data.data(), file_size);
+            out.close();
+            std::cout << "📥 File " << filename << " saved.\n";
         }
         else
         {
-            overall_response += "❌ Unsupported file type: " + file_str + "\n";
+            std::cerr << "❌ Failed to open file for writing: " << filename << "\n";
         }
-    }
 
-    // Step 6: Send final summary back to client
-    uint32_t response_size = htonl(overall_response.size());
-    send(client_socket, &response_size, sizeof(response_size), 0);
-    send(client_socket, overall_response.c_str(), overall_response.size(), 0);
-
-    
-
-    // Send how many result files are coming
-    uint32_t result_count = result_files.size();
-    uint32_t result_count_net = htonl(result_count);
-    send(client_socket, &result_count_net, sizeof(result_count_net), 0);
-
-    for (const std::string &res_file : result_files)
-    {
-        std::ifstream in(res_file, std::ios::binary);
-        if (!in.is_open())
-            continue;
-
-        in.seekg(0, std::ios::end);
-        uint64_t size = in.tellg();
-        in.seekg(0);
-
-        // Send filename
-        uint32_t fname_len = htonl(res_file.length());
-        send(client_socket, &fname_len, sizeof(fname_len), 0);
-        send(client_socket, res_file.c_str(), res_file.length(), 0);
-
-        // Send file size
-        uint64_t size_net = htobe64(size);
-        send(client_socket, &size_net, sizeof(size_net), 0);
-
-        // Send file content
-        char buffer[BUFFER_SIZE];
-        while (!in.eof())
+        // Process file depending on the count type
+        if (count_type == "ip" || count_type == "user")
         {
-            in.read(buffer, BUFFER_SIZE);
-            std::streamsize bytes = in.gcount();
-            send(client_socket, buffer, bytes, 0);
+            if (filename.find(".json") != std::string::npos)
+                count_unique_users_json(filename, count_type);
+            else if (filename.find(".xml") != std::string::npos)
+                count_unique_users_xml(filename, count_type);
+            else if (filename.find(".txt") != std::string::npos)
+                count_unique_users_txt(filename, count_type);
+            
+            std::string result_filename = "result_test_clients/" + filename;
+            result_files.push_back(result_filename);
         }
-
-        in.close();
     }
 
+    // Send the result file count back to client
+    uint32_t result_file_count_net = htonl(result_files.size());
+    send(client_socket, &result_file_count_net, sizeof(result_file_count_net), 0);
+
+    // Send each result file back to the client
+    for (const auto &result_file : result_files)
+    {
+        std::cout << "📤 Sending result file: " << result_file << " to client\n";
+
+        uint32_t filename_len = result_file.length();
+        uint32_t filename_len_net = htonl(filename_len);
+        send(client_socket, &filename_len_net, sizeof(filename_len_net), 0);
+        send(client_socket, result_file.c_str(), filename_len, 0);
+
+        std::ifstream infile(result_file, std::ios::binary);
+        if (!infile)
+        {
+            std::cerr << "❌ Failed to open result file: " << result_file << std::endl;
+            continue;
+        }
+
+        // Get the file size
+        infile.seekg(0, std::ios::end);
+        uint64_t result_file_size = infile.tellg();
+        infile.seekg(0, std::ios::beg);
+
+        // Send the file size
+        uint64_t result_file_size_net = htobe64(result_file_size);
+        send(client_socket, &result_file_size_net, sizeof(result_file_size_net), 0);
+
+        // Send the file data in chunks
+        char file_buffer[BUFFER_SIZE];
+        while (infile.read(file_buffer, sizeof(file_buffer)))
+        {
+            size_t bytes_to_send = infile.gcount();
+            send(client_socket, file_buffer, bytes_to_send, 0);
+        }
+
+        // Send any remaining data
+        if (infile.gcount() > 0)
+        {
+            send(client_socket, file_buffer, infile.gcount(), 0);
+        }
+
+        infile.close();
+        std::cout << "✅ Sent result file: " << result_file << " to client\n";
+    }
+
+    // Close the client connection
     close(client_socket);
+    std::cout << "🔌 Client connection closed.\n";
 }
 
-// --- Server Entry Point ---
-int main()
-{
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1)
-    {
-        perror("❌ socket creation failed");
+int main() {
+    // Step 1: Create a socket
+    int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket == -1) {
+        std::cerr << "❌ Failed to create socket" << std::endl;
         return 1;
     }
 
-    sockaddr_in address{};
-    socklen_t addrlen = sizeof(address);
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+    // Step 2: Set up the server address
+    sockaddr_in server_address;
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = htons(SERVER_PORT);
+    server_address.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_fd, (sockaddr *)&address, sizeof(address)) < 0)
-    {
-        perror("❌ bind failed");
+    // Set socket options to reuse address
+    int reuse = 1;
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+        std::cerr << "❌ Failed to set socket options" << std::endl;
+        close(server_socket);
         return 1;
     }
 
-    if (listen(server_fd, 10) < 0)
-    {
-        perror("❌ listen failed");
+    // Step 3: Bind the socket to the address
+    if (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) == -1) {
+        std::cerr << "❌ Failed to bind socket to address" << std::endl;
+        close(server_socket);
         return 1;
     }
 
-    std::cout << "🚀 Server listening on port " << PORT << "\n";
+    // Step 4: Start listening for incoming connections
+    if (listen(server_socket, 10) == -1) {
+        std::cerr << "❌ Failed to listen on socket" << std::endl;
+        close(server_socket);
+        return 1;
+    }
 
-    while (true)
-    {
-        int client_socket = accept(server_fd, (sockaddr *)&address, &addrlen);
-        if (client_socket < 0)
-        {
-            perror("❌ accept failed");
+    std::cout << "🚀 Server is listening on port " << SERVER_PORT << "..." << std::endl;
+
+    // Step 5: Main loop to accept and handle client connections
+    while (true) {
+        // Accept a new client connection
+        int client_socket = accept(server_socket, nullptr, nullptr);
+        if (client_socket == -1) {
+            std::cerr << "❌ Failed to accept client connection" << std::endl;
             continue;
         }
 
-        std::thread([client_socket]()
-                    { handle_client(client_socket); })
-            .detach();
+        std::cout << "✔️ Client connected!" << std::endl;
+
+        // Handle the client in a separate thread
+        std::thread client_thread(handle_client, client_socket);
+        client_thread.detach();
     }
 
-    close(server_fd);
+    // Cleanup (though this won't be reached in this infinite loop)
+    close(server_socket);
     return 0;
 }
-
