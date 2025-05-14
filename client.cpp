@@ -13,6 +13,7 @@
 #define BUFFER_SIZE 1024
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 int main()
 {
@@ -42,7 +43,7 @@ int main()
         return 1;
     }
 
-    // Step 1: Collect user inputs (Remove file format as it's no longer necessary)
+    // Step 1: Collect user inputs
     std::string group_by;
     std::cout << "Enter grouping criteria (user/ip/level): ";
     std::cin >> group_by;
@@ -61,14 +62,43 @@ int main()
         std::getline(std::cin, end_date);
     }
 
-    // Step 2: Load all three log files
-    std::ifstream json_file("test_clients/log_file.json");
-    std::ifstream txt_file("test_clients/log_file.txt");
-    std::ifstream xml_file("test_clients/log_file.xml");
+    // Step 2: Select a random subfolder in test_clients
+    std::string base_dir = "test_clients";
+    std::vector<fs::path> subdirs;
+
+    for (const auto &entry : fs::directory_iterator(base_dir))
+    {
+        if (fs::is_directory(entry.status()))
+        {
+            subdirs.push_back(entry.path());
+        }
+    }
+
+    if (subdirs.empty())
+    {
+        std::cerr << "No subdirectories found in test_clients.\n";
+        return 1;
+    }
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, subdirs.size() - 1);
+    fs::path chosen_dir = subdirs[dis(gen)];
+
+    std::cout << "Randomly selected folder: " << chosen_dir << std::endl;
+
+    // Step 3: Load all three log files from chosen folder
+    fs::path json_path = chosen_dir / "log_file.json";
+    fs::path txt_path = chosen_dir / "log_file.txt";
+    fs::path xml_path = chosen_dir / "log_file.xml";
+
+    std::ifstream json_file(json_path);
+    std::ifstream txt_file(txt_path);
+    std::ifstream xml_file(xml_path);
 
     if (!json_file || !txt_file || !xml_file)
     {
-        std::cerr << "Failed to open one or more log files.\n";
+        std::cerr << "Failed to open one or more log files in " << chosen_dir << "\n";
         return 1;
     }
 
@@ -85,7 +115,7 @@ int main()
     txt_file.close();
     xml_file.close();
 
-    // Step 3: Construct JSON envelope for all three files
+    // Step 4: Construct JSON envelope
     json envelope;
     envelope["group_by"] = group_by;
     if (!start_date.empty() && !end_date.empty())
@@ -100,12 +130,12 @@ int main()
 
     std::string payload = envelope.dump();
 
-    // Step 4: Send JSON payload containing all log files
+    // Step 5: Send payload to server
     send(sock, payload.c_str(), payload.size(), 0);
     shutdown(sock, SHUT_WR);
     std::cout << "Log files and metadata sent. Waiting for server response...\n";
 
-    // Step 5: Receive response for JSON, TXT, and XML files
+    // Step 6: Receive response
     std::ostringstream response_stream;
     int bytesRead;
     while ((bytesRead = read(sock, buffer, BUFFER_SIZE)) > 0)
@@ -115,7 +145,7 @@ int main()
 
     std::string server_response = response_stream.str();
 
-    // Step 6: Save the responses in corresponding result files
+    // Step 7: Parse and save server response
     std::ofstream json_result_file("json_result.txt");
     std::ofstream txt_result_file("txt_result.txt");
     std::ofstream xml_result_file("xml_result.txt");
